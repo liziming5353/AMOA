@@ -421,7 +421,15 @@ class Transformer(nn.Module):
         out = (out[:,0,:], out, hidden) # ([CLS] token embedding, full output, last hidden layer)
         return out
 
-
+class MyCSA(nn.Module):
+    def __init__(self, layer, num_layers):
+        super(MyCSA, self).__init__()
+        self.layers = _get_clones(layer, num_layers)
+    def forward(self, src, context, attention_mask=None):
+        for layer in self.layers:
+            new_src = layer(src, context, attention_mask=attention_mask)
+            context = new_src
+        return context
 
 class TransformerLayer(nn.Module):
     def __init__(self, hidden_size, nhead=1, dim_feedforward=128, dropout=0.1):
@@ -559,9 +567,10 @@ class my_attention1(nn.Module):#用text做key和value，用audio做q，做注意
         super(my_attention1, self).__init__()
         self.context_cross_attention = Attention(context_size, nhead, dropout, ctx_dim=hidden_size)
   
-        self.self_attention = Attention(context_size, nhead, dropout)
+        self.fc1 = nn.Sequential(nn.Linear(context_size, context_size), nn.ReLU(), nn.Linear(context_size, context_size))
 
         self.norm1 = nn.LayerNorm(context_size)
+        self.norm3 = nn.LayerNorm(context_size)
         self.dropout1 = nn.Dropout(dropout)
 
     def forward(self, src, context, attention_mask=None):
@@ -569,13 +578,12 @@ class my_attention1(nn.Module):#用text做key和value，用audio做q，做注意
         audio = (context)
 
         new_src = self.context_cross_attention(audio, text, attention_mask=attention_mask)
-        cross_src = new_src
-        cross_src_1 = self.self_attention(cross_src, cross_src, attention_mask=attention_mask)
+        cross_src = new_src+audio
+        cross_src = self.norm3(cross_src)
+        #cross_src_1 = self.self_attention(cross_src, cross_src, attention_mask=attention_mask)
+        cross_src_1 = self.fc1(cross_src)
         cross_src = cross_src + self.dropout1(cross_src_1)
         cross_src = self.norm1(cross_src)
-
-
-
         return cross_src
 
 class BertFinetun(nn.Module):
@@ -998,6 +1006,97 @@ class BertFinetun9(nn.Module):#sota
         fusion = torch.cat((cross_src1, IS), dim=1)
 
         
+        return fusion, loss_c*0.1
+
+class BertFinetun10(nn.Module):#sota
+    def __init__(self, text_size, audio_size, video_size, nhead, dropout, q_size, contrastive):
+        super(BertFinetun10, self).__init__()
+        # self.att1 = my_attention3(text_size, audio_size, nhead, dropout)
+        # self.att2 = my_attention3(audio_size, video_size, nhead, dropout)
+        self.att1 = MyCSA(my_attention1(text_size, text_size, nhead, dropout),6)
+        self.att2 = MyCSA(my_attention1(text_size, text_size, nhead, dropout),6)
+        self.IS_encoder = Transformer(1582, num_layers=1, nhead=1, dim_feedforward=512)
+        # self.fc2 = nn.Sequential(nn.Linear(1582, 1582), 
+        #                 nn.ReLU(), 
+        #                 nn.Dropout(dropout), 
+        #                 nn.Linear(1582, 1582))
+        self.fc3 = nn.Sequential(nn.Linear(audio_size, audio_size), nn.ReLU(), nn.Linear(audio_size,  audio_size))
+        self.fc4 = nn.Sequential(nn.Linear(3*text_size, 3*text_size), nn.ReLU(), nn.Linear(3*text_size,  3*text_size))
+        #self.fc_sp = nn.Linear(22, 22)
+        self.self_attention = Attention(3*text_size, nhead, dropout)
+        self.norm1 = nn.LayerNorm(3*text_size)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.dropout4 = nn.Dropout(dropout)
+        self.contrastive = contrastive
+        self.fc5 = nn.Sequential(nn.Linear(3*text_size, 2*text_size), nn.ReLU(), nn.Linear(2*text_size,  audio_size))
+        self.fc_t = nn.Linear(768,768)
+        self.fc_a = nn.Linear(1582,768)
+        self.fc_v = nn.Linear(711,768)
+        if self.contrastive:
+            self.q_size = q_size
+            self.tav_q = []
+            self.IS_q = []
+    def forward(self, src, context, attention_mask=None, IS=None, video=None, speaker=None):
+        text = self.fc_t(src)
+        audio = self.fc_a(context)
+        video = self.fc_v(video)
+
+        text_audio = self.att1(text, audio, attention_mask)
+        #print(text_audio.shape)
+        text_video = self.att2(text_audio, video, attention_mask)
+        text_audio_video = torch.cat((text, text_audio, text_video), dim=2)
+        text_audio_video = text_audio_video+self.dropout3(self.self_attention(text_audio_video, text_audio_video, attention_mask=attention_mask))
+        text_audio_video = text_audio_video+self.dropout4(self.fc4(text_audio_video))
+        #text_audio_video = self.dropout2(text_audio_video)
+        text_audio_video = self.norm1(text_audio_video)
+        text_audio_video = self.fc5(text_audio_video)
+        cross_src1 = F.max_pool1d(text_audio_video.permute(0,2,1).contiguous(),text_audio_video.shape[1]).squeeze(-1)
+
+        #cross_src2 = F.max_pool1d(text_video.permute(0,2,1).contiguous(),text_video.shape[1]).squeeze(-1)
+        _, _, IS_em = self.IS_encoder(IS)
+        #IS = IS + self.dropout2(IS_em)
+        IS = self.fc3(IS_em)
+        #IS = IS_em
+
+        IS = F.max_pool1d(IS.permute(0,2,1).contiguous(),IS.shape[1]).squeeze(-1)
+        #sp = self.fc_sp(speaker)
+        #padding = torch.zeros([cross_src1.shape[0],1582-921], dtype=torch.float32).cuda()
+        #cross_src2 = torch.cat((cross_src1,padding), dim=1)
+        cross_src2 = cross_src1
+        if self.contrastive:
+            cross_src1_list = cross_src2.tolist()
+            IS_list = IS.tolist()
+            #dis_pos = []
+            #BCEWithLogitsLoss_f = nn.BCEWithLogitsLoss()
+
+            dispos =  cosin2(cross_src2,IS).cuda()
+            # print(cross_src1.shape)
+            # print(torch.tensor(self.IS_q).t()).shape
+
+            if len(self.IS_q)>0:
+                # disneg1 = torch.einsum('nc,ck->nk', [cross_src1, torch.tensor(self.IS_q).t().cuda()])
+                # disneg2 = torch.einsum('nc,ck->nk', [IS, torch.tensor(self.tav_q).t().cuda()])
+                disneg1 = cosin1(cross_src2, torch.tensor(self.IS_q).cuda())
+                disneg2 = cosin1(IS, torch.tensor(self.tav_q).cuda())
+                #disneg = (disneg1+disneg2)/2
+                dis = torch.cat((dispos, disneg1, disneg2), dim=1)
+                #dis = torch.sigmoid(dis)
+                zeros = torch.zeros(dis.shape[0], dtype=torch.long).cuda()
+                criterion = nn.CrossEntropyLoss()
+                loss_c = criterion(dis, zeros)
+            else:
+                loss_c = 0
+            for i in range(len(cross_src1_list)):
+                self.tav_q.append(cross_src1_list[i])
+                self.IS_q.append(IS_list[i])
+            while len(self.tav_q)>self.q_size:
+                del self.tav_q[0]
+                del self.IS_q[0]
+        else:
+            loss_c = 0
+        fusion = torch.cat((cross_src1, IS), dim=1)
+        #print(fusion.shape)
         return fusion, loss_c*0.1
 
 class BertEncoder(nn.Module):
@@ -1588,7 +1687,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         #self.lstm = nn.LSTM(63, 63, batch_first=True)
 
         #self.BertFinetun1 = BertFinetun1(768, 63, 90, 1, q_size = self.q_size)
-        self.BertFinetun8 = BertFinetun9(768, 1582, 711, 1, 0.1, self.q_size, self.contrastive)
+        self.BertFinetun8 = BertFinetun10(768, 1582, 711, 1, 0.1, self.q_size, self.contrastive)
         #self.BertFinetun3 = BertFinetun(768, 63, 90, 1, 0.01, self.q_size, self.contrastive)
         self.acoustic_model = Transformer(1582, num_layers=1, nhead=2, dim_feedforward=512)
         self.acoustic_model1 = Transformer(711, num_layers=1, nhead=3, dim_feedforward=512)
