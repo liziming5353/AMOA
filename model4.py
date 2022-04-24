@@ -421,15 +421,7 @@ class Transformer(nn.Module):
         out = (out[:,0,:], out, hidden) # ([CLS] token embedding, full output, last hidden layer)
         return out
 
-class MyCSA(nn.Module):
-    def __init__(self, layer, num_layers):
-        super(MyCSA, self).__init__()
-        self.layers = _get_clones(layer, num_layers)
-    def forward(self, src, context, attention_mask=None):
-        for layer in self.layers:
-            new_src = layer(src, context, attention_mask=attention_mask)
-            context = new_src
-        return context
+
 
 class TransformerLayer(nn.Module):
     def __init__(self, hidden_size, nhead=1, dim_feedforward=128, dropout=0.1):
@@ -465,6 +457,16 @@ class TransformerEncoder(nn.Module):
             src = src + new_src
         return src
 
+class MyCSA1(nn.Module):
+    def __init__(self, text_size, audio_size, nhead, dropout):
+        super(MyCSA1, self).__init__()
+        self.layer1 = my_attention1(text_size, audio_size, nhead, dropout)
+        self.layer2 = my_attention1(text_size, audio_size, nhead, dropout)
+    def forward(self, src, context, attention_mask=None):
+        rr = context
+        rr1 = self.layer1(src,rr,attention_mask=attention_mask)
+        rr2 = self.layer2(src,rr1,attention_mask=attention_mask)
+        return rr2
 
 class Attention(nn.Module):
     def __init__(self, hidden_size, num_attention_heads, attention_probs_dropout_prob, ctx_dim=None):
@@ -540,6 +542,13 @@ class my_attention(nn.Module):#用text做key和value，用audio做q，做注意�
         self.norm4 = nn.LayerNorm(context_size)
         self.fc1 = nn.Sequential(nn.Linear(context_size, context_size), nn.ReLU(), nn.Linear(context_size, context_size))
         self.fc2 = nn.Sequential(nn.Linear(context_size, context_size), nn.ReLU(), nn.Linear(context_size,  context_size))
+        # print("AA")
+        # from IPython.core import debugger
+        # debug = debugger.Pdb().set_trace
+        # print("BB")
+        # def buggy_method():
+        #     debug()
+        # print("CC")
     def forward(self, src, context, attention_mask=None):
         text = (src)
         audio = (context)
@@ -896,6 +905,7 @@ class BertFinetun8(nn.Module):#用text做key和value，用audio做q，做注意�
 class BertFinetun9(nn.Module):#sota
     def __init__(self, text_size, audio_size, video_size, nhead, dropout, q_size, contrastive):
         super(BertFinetun9, self).__init__()
+        
         self.att1 = my_attention(text_size, audio_size, nhead, dropout)
         self.att1_v = my_attention(audio_size, text_size, nhead, dropout)
         self.att2 = my_attention(text_size+audio_size, video_size, nhead, dropout)
@@ -931,8 +941,13 @@ class BertFinetun9(nn.Module):#sota
         self.contrastive = contrastive
         if self.contrastive:
             self.q_size = q_size
-            self.tav_q = []
-            self.IS_q = []
+            self.size_t = 0
+            # self.tav_q = []
+            # self.IS_q = []
+            self.tav_q = torch.zeros([q_size,1582]).cuda()
+            self.IS_q = torch.zeros([q_size,1582]).cuda()
+            # self.tav_q = self.tav_q1.clone().detach().cuda()
+            # self.IS_q = self.IS_q1.clone().detach().cuda()
     def forward(self, src, context, attention_mask=None, IS=None, video=None, speaker=None):
         text = (src)
         audio = (context)
@@ -973,20 +988,21 @@ class BertFinetun9(nn.Module):#sota
         #cross_src2 = torch.cat((cross_src1,padding), dim=1)
         cross_src2 = cross_src1
         if self.contrastive:
-            cross_src1_list = cross_src2.tolist()
-            IS_list = IS.tolist()
-            #dis_pos = []
-            #BCEWithLogitsLoss_f = nn.BCEWithLogitsLoss()
 
-            dispos =  cosin2(cross_src2,IS).cuda()
-            # print(cross_src1.shape)
+            # print(cross_src2.shape)
             # print(torch.tensor(self.IS_q).t()).shape
+            cross_src1_list = cross_src2
+            IS_list = IS
+            if self.size_t>0:
 
-            if len(self.IS_q)>0:
+                #dis_pos = []
+                #BCEWithLogitsLoss_f = nn.BCEWithLogitsLoss()
+
+                dispos =  cosin2(cross_src2,IS).cuda()
                 # disneg1 = torch.einsum('nc,ck->nk', [cross_src1, torch.tensor(self.IS_q).t().cuda()])
                 # disneg2 = torch.einsum('nc,ck->nk', [IS, torch.tensor(self.tav_q).t().cuda()])
-                disneg1 = cosin1(cross_src2, torch.tensor(self.IS_q).cuda())
-                disneg2 = cosin1(IS, torch.tensor(self.tav_q).cuda())
+                disneg1 = cosin1(cross_src2, self.IS_q[:self.size_t].clone().detach())
+                disneg2 = cosin1(IS, self.tav_q[:self.size_t].clone().detach())
                 #disneg = (disneg1+disneg2)/2
                 dis = torch.cat((dispos, disneg1, disneg2), dim=1)
                 #dis = torch.sigmoid(dis)
@@ -995,12 +1011,23 @@ class BertFinetun9(nn.Module):#sota
                 loss_c = criterion(dis, zeros)
             else:
                 loss_c = 0
-            for i in range(len(cross_src1_list)):
-                self.tav_q.append(cross_src1_list[i])
-                self.IS_q.append(IS_list[i])
-            while len(self.tav_q)>self.q_size:
-                del self.tav_q[0]
-                del self.IS_q[0]
+            cha = len(cross_src1_list)+self.size_t-self.q_size
+            if cha>0:
+                tav_q1=self.tav_q[:self.size_t-cha]
+                IS_q1=self.IS_q[:self.size_t-cha]
+                self.tav_q = torch.cat((cross_src1_list,tav_q1),dim=0)
+                self.IS_q = torch.cat((IS_list,IS_q1),dim=0)
+                self.size_t = self.q_size
+            else:
+                tav_q1=self.tav_q[:self.q_size-len(cross_src1_list)]
+                IS_q1=self.IS_q[:self.q_size-len(cross_src1_list)]
+                self.tav_q = torch.cat((cross_src1_list,tav_q1),dim=0)
+                self.IS_q = torch.cat((IS_list,IS_q1),dim=0)
+                self.size_t += len(cross_src1_list)
+            if len(self.tav_q)!=self.q_size or len(self.IS_q)!=self.q_size:
+                print(250)
+                exit(0)
+
         else:
             loss_c = 0
         fusion = torch.cat((cross_src1, IS), dim=1)
@@ -1013,8 +1040,10 @@ class BertFinetun10(nn.Module):#sota
         super(BertFinetun10, self).__init__()
         # self.att1 = my_attention3(text_size, audio_size, nhead, dropout)
         # self.att2 = my_attention3(audio_size, video_size, nhead, dropout)
-        self.att1 = MyCSA(my_attention1(text_size, text_size, nhead, dropout),6)
-        self.att2 = MyCSA(my_attention1(text_size, text_size, nhead, dropout),6)
+        # self.att1 = MyCSA(my_attention1(text_size, text_size, nhead, dropout),6)
+        # self.att2 = MyCSA(my_attention1(text_size, text_size, nhead, dropout),6)
+        self.att1 = MyCSA1(text_size, text_size, nhead, dropout)
+        self.att2 = MyCSA1(text_size, text_size, nhead, dropout)
         self.IS_encoder = Transformer(1582, num_layers=1, nhead=1, dim_feedforward=512)
         # self.fc2 = nn.Sequential(nn.Linear(1582, 1582), 
         #                 nn.ReLU(), 
@@ -1035,8 +1064,13 @@ class BertFinetun10(nn.Module):#sota
         self.fc_v = nn.Linear(711,768)
         if self.contrastive:
             self.q_size = q_size
-            self.tav_q = []
-            self.IS_q = []
+            self.size_t = 0
+            # self.tav_q = []
+            # self.IS_q = []
+            self.tav_q = torch.zeros([q_size,1582]).cuda()
+            self.IS_q = torch.zeros([q_size,1582]).cuda()
+            # self.tav_q = self.tav_q1.clone().detach().cuda()
+            # self.IS_q = self.IS_q1.clone().detach().cuda()
     def forward(self, src, context, attention_mask=None, IS=None, video=None, speaker=None):
         text = self.fc_t(src)
         audio = self.fc_a(context)
@@ -1065,20 +1099,21 @@ class BertFinetun10(nn.Module):#sota
         #cross_src2 = torch.cat((cross_src1,padding), dim=1)
         cross_src2 = cross_src1
         if self.contrastive:
-            cross_src1_list = cross_src2.tolist()
-            IS_list = IS.tolist()
-            #dis_pos = []
-            #BCEWithLogitsLoss_f = nn.BCEWithLogitsLoss()
 
-            dispos =  cosin2(cross_src2,IS).cuda()
-            # print(cross_src1.shape)
+            # print(cross_src2.shape)
             # print(torch.tensor(self.IS_q).t()).shape
+            cross_src1_list = cross_src2
+            IS_list = IS
+            if self.size_t>0:
 
-            if len(self.IS_q)>0:
+                #dis_pos = []
+                #BCEWithLogitsLoss_f = nn.BCEWithLogitsLoss()
+
+                dispos =  cosin2(cross_src2,IS).cuda()
                 # disneg1 = torch.einsum('nc,ck->nk', [cross_src1, torch.tensor(self.IS_q).t().cuda()])
                 # disneg2 = torch.einsum('nc,ck->nk', [IS, torch.tensor(self.tav_q).t().cuda()])
-                disneg1 = cosin1(cross_src2, torch.tensor(self.IS_q).cuda())
-                disneg2 = cosin1(IS, torch.tensor(self.tav_q).cuda())
+                disneg1 = cosin1(cross_src2, self.IS_q[:self.size_t].clone().detach())
+                disneg2 = cosin1(IS, self.tav_q[:self.size_t].clone().detach())
                 #disneg = (disneg1+disneg2)/2
                 dis = torch.cat((dispos, disneg1, disneg2), dim=1)
                 #dis = torch.sigmoid(dis)
@@ -1087,12 +1122,23 @@ class BertFinetun10(nn.Module):#sota
                 loss_c = criterion(dis, zeros)
             else:
                 loss_c = 0
-            for i in range(len(cross_src1_list)):
-                self.tav_q.append(cross_src1_list[i])
-                self.IS_q.append(IS_list[i])
-            while len(self.tav_q)>self.q_size:
-                del self.tav_q[0]
-                del self.IS_q[0]
+            cha = len(cross_src1_list)+self.size_t-self.q_size
+            if cha>0:
+                tav_q1=self.tav_q[:self.size_t-cha]
+                IS_q1=self.IS_q[:self.size_t-cha]
+                self.tav_q = torch.cat((cross_src1_list,tav_q1),dim=0)
+                self.IS_q = torch.cat((IS_list,IS_q1),dim=0)
+                self.size_t = self.q_size
+            else:
+                tav_q1=self.tav_q[:self.q_size-len(cross_src1_list)]
+                IS_q1=self.IS_q[:self.q_size-len(cross_src1_list)]
+                self.tav_q = torch.cat((cross_src1_list,tav_q1),dim=0)
+                self.IS_q = torch.cat((IS_list,IS_q1),dim=0)
+                self.size_t += len(cross_src1_list)
+            if len(self.tav_q)!=self.q_size or len(self.IS_q)!=self.q_size:
+                print(250)
+                exit(0)
+
         else:
             loss_c = 0
         fusion = torch.cat((cross_src1, IS), dim=1)
